@@ -1,0 +1,1168 @@
+Reverse Proxy Core (Phase 1) - Documentation + Full Source Code
+=================================================================
+
+NOTE ON CURRENT LAYOUT
+----------------------
+The project was reorganized into a standard layered structure.
+
+- Java source root: `src/main/java`
+- Main entry class: `com.reverseproxy.core.ProxyServer`
+- Test script: `scripts/test_proxy.sh`
+- Documentation folder: `docs/`
+
+Current structure:
+
+- `src/main/java/com/reverseproxy/core/ProxyServer.java`
+- `src/main/java/com/reverseproxy/core/handler/ClientHandler.java`
+- `src/main/java/com/reverseproxy/core/parser/HttpParser.java`
+- `src/main/java/com/reverseproxy/core/model/HttpRequest.java`
+- `scripts/test_proxy.sh`
+- `docs/PHASE1_DOCUMENTATION.txt`
+
+Project Goal
+------------
+Build the core of a custom reverse proxy in pure Java (no frameworks), focused on:
+
+1) TCP listener and connection accept loop
+2) Fixed thread pool worker model (platform threads)
+3) Manual HTTP request parsing from raw bytes
+4) Request safety controls (read timeout, max header size)
+5) Keep-alive support
+6) Dummy HTTP response for end-to-end testing
+
+
+High-Level Flow (Start to End)
+------------------------------
+1) `ProxyServer` starts and opens a `ServerSocket` on a configured port.
+2) Main thread blocks on `accept()` in an infinite loop.
+3) For each accepted socket, `ProxyServer` submits a `ClientHandler` to a fixed thread pool.
+4) `ClientHandler` sets socket read timeout and enters a keep-alive request loop.
+5) `ClientHandler` calls `HttpParser.parse(...)` to read and parse one request:
+   - request line (`METHOD PATH VERSION`)
+   - headers (until blank line)
+   - body (exact `Content-Length` bytes)
+6) If request is valid, server prints parsed request and sends `200 OK` with `Hello from Proxy Core`.
+7) If keep-alive is enabled, same socket can handle another request (up to configured max).
+8) On malformed request, oversized headers, timeout, or connection-close condition, socket is closed.
+
+
+File 1: ProxyServer.java
+------------------------
+Job:
+- Entry point of the server.
+- Owns core config constants.
+- Accepts sockets and delegates work to the thread pool.
+
+Key responsibilities:
+- Port configuration and validation.
+- Fixed worker pool creation.
+- Infinite TCP accept loop.
+- Shutdown hook for graceful worker pool shutdown.
+
+Full source code:
+
+```java
+import java.io.IOException;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+/**
+ * TCP acceptor for incoming client connections.
+ */
+public final class ProxyServer {
+    private static final int DEFAULT_PORT = 8080;
+    private static final int WORKER_POOL_SIZE = 200;
+    private static final int SOCKET_READ_TIMEOUT_MILLIS = 10_000;
+    private static final int MAX_HEADER_BYTES = 16 * 1024;
+    private static final int MAX_KEEP_ALIVE_REQUESTS = 100;
+
+    private ProxyServer() {
+    }
+
+    public static void main(String[] args) {
+        int port = resolvePort(args);
+        ExecutorService workerPool = Executors.newFixedThreadPool(WORKER_POOL_SIZE);
+
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            System.out.println("Shutting down worker pool...");
+            workerPool.shutdown();
+        }));
+
+        try (ServerSocket serverSocket = new ServerSocket(port)) {
+            System.out.println("Reverse proxy core listening on port " + port);
+
+            while (true) {
+                Socket clientSocket = serverSocket.accept();
+                workerPool.submit(new ClientHandler(
+                        clientSocket,
+                        SOCKET_READ_TIMEOUT_MILLIS,
+                        MAX_HEADER_BYTES,
+                        MAX_KEEP_ALIVE_REQUESTS
+                ));
+            }
+        } catch (IOException ex) {
+            System.err.println("Server error: " + ex.getMessage());
+        }
+    }
+
+    private static int resolvePort(String[] args) {
+        if (args.length == 0) {
+            return DEFAULT_PORT;
+        }
+
+        try {
+            int port = Integer.parseInt(args[0]);
+            if (port < 1 || port > 65535) {
+                throw new IllegalArgumentException("Port must be in range 1-65535");
+            }
+            return port;
+        } catch (NumberFormatException ex) {
+            throw new IllegalArgumentException("Invalid port: " + args[0], ex);
+        }
+    }
+}
+```
+
+
+File 2: ClientHandler.java
+--------------------------
+Job:
+- Handles one client socket in a worker thread.
+- Parses requests, applies timeout/keep-alive behavior, and writes responses.
+
+Key responsibilities:
+- Set socket read timeout.
+- Loop to support multiple requests on one keep-alive connection.
+- Call parser and handle parser exceptions.
+- Return correct HTTP status for error cases:
+  - 400 for malformed request
+  - 431 for oversized headers
+  - 500 for unexpected internal errors
+- Return test `200 OK` response body.
+
+Full source code:
+
+```java
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.SocketTimeoutException;
+import java.nio.charset.StandardCharsets;
+import java.net.Socket;
+import java.util.Map;
+
+/**
+ * Worker task that parses one client request and returns a dummy response.
+ */
+public final class ClientHandler implements Runnable {
+    private final Socket clientSocket;
+    private final int socketReadTimeoutMillis;
+    private final int maxHeaderBytes;
+    private final int maxKeepAliveRequests;
+
+    public ClientHandler(
+            Socket clientSocket,
+            int socketReadTimeoutMillis,
+            int maxHeaderBytes,
+            int maxKeepAliveRequests
+    ) {
+        this.clientSocket = clientSocket;
+        this.socketReadTimeoutMillis = socketReadTimeoutMillis;
+        this.maxHeaderBytes = maxHeaderBytes;
+        this.maxKeepAliveRequests = maxKeepAliveRequests;
+    }
+
+    @Override
+    public void run() {
+        try (Socket socket = clientSocket;
+             InputStream inputStream = socket.getInputStream();
+             OutputStream outputStream = socket.getOutputStream()) {
+            socket.setSoTimeout(socketReadTimeoutMillis);
+
+            int handledRequests = 0;
+            while (handledRequests < maxKeepAliveRequests) {
+                HttpRequest request;
+                try {
+                    request = HttpParser.parse(inputStream, maxHeaderBytes);
+                } catch (SocketTimeoutException ex) {
+                    System.out.println("Connection idle timeout from " + socket.getRemoteSocketAddress());
+                    break;
+                } catch (HttpParser.HeaderTooLargeException ex) {
+                    writeErrorResponse(
+                            outputStream,
+                            431,
+                            "Request Header Fields Too Large",
+                            "Request headers too large"
+                    );
+                    break;
+                } catch (HttpParser.MalformedRequestException ex) {
+                    writeErrorResponse(outputStream, 400, "Bad Request", "Malformed request");
+                    break;
+                } catch (IOException ex) {
+                    writeErrorResponse(
+                            outputStream,
+                            500,
+                            "Internal Server Error",
+                            "Failed to process request"
+                    );
+                    break;
+                }
+
+                if (request == null) {
+                    break;
+                }
+
+                handledRequests += 1;
+
+                printRequest(socket, request);
+
+                boolean keepAlive = shouldKeepAlive(request)
+                        && handledRequests < maxKeepAliveRequests;
+
+                writeOkResponse(outputStream, keepAlive);
+
+                if (!keepAlive) {
+                    break;
+                }
+            }
+
+        } catch (IOException ex) {
+            System.err.println("Client handling error: " + ex.getMessage());
+        }
+    }
+
+    private static void printRequest(Socket socket, HttpRequest request) {
+        System.out.println("----- Incoming Request from "
+                + socket.getRemoteSocketAddress()
+                + " -----");
+        System.out.println(request);
+        System.out.println("-----------------------------------------------");
+    }
+
+    private static boolean shouldKeepAlive(HttpRequest request) {
+        String connectionHeader = getHeaderIgnoreCase(request.getHeaders(), "Connection");
+
+        if ("HTTP/1.1".equalsIgnoreCase(request.getHttpVersion())) {
+            return !containsTokenIgnoreCase(connectionHeader, "close");
+        }
+
+        if ("HTTP/1.0".equalsIgnoreCase(request.getHttpVersion())) {
+            return containsTokenIgnoreCase(connectionHeader, "keep-alive");
+        }
+
+        return false;
+    }
+
+    private static String getHeaderIgnoreCase(Map<String, String> headers, String headerName) {
+        for (Map.Entry<String, String> entry : headers.entrySet()) {
+            if (headerName.equalsIgnoreCase(entry.getKey())) {
+                return entry.getValue();
+            }
+        }
+        return null;
+    }
+
+    private static boolean containsTokenIgnoreCase(String headerValue, String token) {
+        if (headerValue == null || headerValue.isEmpty()) {
+            return false;
+        }
+
+        String[] tokens = headerValue.split(",");
+        for (String valueToken : tokens) {
+            if (token.equalsIgnoreCase(valueToken.trim())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void writeOkResponse(OutputStream outputStream, boolean keepAlive) throws IOException {
+        byte[] responseBody = "Hello from Proxy Core".getBytes(StandardCharsets.UTF_8);
+
+        String responseHeaders = "HTTP/1.1 200 OK\r\n"
+                + "Content-Type: text/plain; charset=utf-8\r\n"
+                + "Content-Length: " + responseBody.length + "\r\n"
+                + "Connection: " + (keepAlive ? "keep-alive" : "close") + "\r\n"
+                + "\r\n";
+
+        outputStream.write(responseHeaders.getBytes(StandardCharsets.US_ASCII));
+        outputStream.write(responseBody);
+        outputStream.flush();
+    }
+
+    private static void writeErrorResponse(
+            OutputStream outputStream,
+            int statusCode,
+            String reason,
+            String message
+    ) throws IOException {
+        byte[] responseBody = message.getBytes(StandardCharsets.UTF_8);
+
+        String responseHeaders = "HTTP/1.1 " + statusCode + " " + reason + "\r\n"
+                + "Content-Type: text/plain; charset=utf-8\r\n"
+                + "Content-Length: " + responseBody.length + "\r\n"
+                + "Connection: close\r\n"
+                + "\r\n";
+
+        outputStream.write(responseHeaders.getBytes(StandardCharsets.US_ASCII));
+        outputStream.write(responseBody);
+        outputStream.flush();
+    }
+}
+```
+
+
+File 3: HttpParser.java
+-----------------------
+Job:
+- Parse raw bytes from `InputStream` into a structured `HttpRequest` object.
+
+Key responsibilities:
+- Read request line until CRLF.
+- Read headers until empty line.
+- Enforce max header size using a byte counter.
+- Parse `Content-Length` safely.
+- Read exact body size (not until EOF).
+- Throw explicit exceptions for malformed requests and oversized headers.
+
+Full source code:
+
+```java
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+/**
+ * Manual HTTP/1.x request parser that reads from a raw InputStream.
+ */
+public final class HttpParser {
+    private static final int DEFAULT_MAX_HEADER_BYTES = 16 * 1024;
+
+    private HttpParser() {
+    }
+
+    public static HttpRequest parse(InputStream inputStream) throws IOException {
+        return parse(inputStream, DEFAULT_MAX_HEADER_BYTES);
+    }
+
+    public static HttpRequest parse(InputStream inputStream, int maxHeaderBytes) throws IOException {
+        if (maxHeaderBytes <= 0) {
+            throw new IllegalArgumentException("maxHeaderBytes must be greater than 0");
+        }
+
+        HeaderSizeTracker headerSizeTracker = new HeaderSizeTracker(maxHeaderBytes);
+
+        String requestLine = readLine(inputStream, headerSizeTracker);
+        if (requestLine == null) {
+            return null;
+        }
+
+        if (requestLine.isEmpty()) {
+            throw new MalformedRequestException("Empty request line");
+        }
+
+        String[] requestParts = requestLine.split(" ");
+        if (requestParts.length != 3) {
+            throw new MalformedRequestException("Malformed request line: " + requestLine);
+        }
+
+        String method = requestParts[0];
+        String path = requestParts[1];
+        String httpVersion = requestParts[2];
+
+        Map<String, String> headers = new LinkedHashMap<>();
+        while (true) {
+            String headerLine = readLine(inputStream, headerSizeTracker);
+            if (headerLine == null) {
+                throw new MalformedRequestException("Unexpected end of stream while reading headers");
+            }
+
+            if (headerLine.isEmpty()) {
+                break;
+            }
+
+            int separatorIndex = headerLine.indexOf(':');
+            if (separatorIndex <= 0) {
+                throw new MalformedRequestException("Malformed header line: " + headerLine);
+            }
+
+            String headerName = headerLine.substring(0, separatorIndex).trim();
+            String headerValue = headerLine.substring(separatorIndex + 1).trim();
+            headers.put(headerName, headerValue);
+        }
+
+        int contentLength = extractContentLength(headers);
+        byte[] body = readBody(inputStream, contentLength);
+
+        return new HttpRequest(method, path, httpVersion, headers, body);
+    }
+
+    private static String readLine(InputStream inputStream, HeaderSizeTracker headerSizeTracker)
+            throws IOException {
+        ByteArrayOutputStream lineBuffer = new ByteArrayOutputStream();
+        int previous = -1;
+
+        while (true) {
+            int current = inputStream.read();
+            if (current == -1) {
+                if (lineBuffer.size() == 0 && previous == -1) {
+                    return null;
+                }
+                throw new MalformedRequestException("Unexpected end of stream while reading line");
+            }
+
+            headerSizeTracker.increment();
+
+            if (previous == '\r' && current == '\n') {
+                byte[] rawLine = lineBuffer.toByteArray();
+                int length = rawLine.length;
+                if (length > 0 && rawLine[length - 1] == '\r') {
+                    length = length - 1;
+                }
+                return new String(rawLine, 0, length, StandardCharsets.US_ASCII);
+            }
+
+            lineBuffer.write(current);
+            previous = current;
+        }
+    }
+
+    private static int extractContentLength(Map<String, String> headers)
+            throws MalformedRequestException {
+        for (Map.Entry<String, String> entry : headers.entrySet()) {
+            if ("Content-Length".equalsIgnoreCase(entry.getKey())) {
+                String value = entry.getValue();
+                try {
+                    int contentLength = Integer.parseInt(value);
+                    if (contentLength < 0) {
+                        throw new MalformedRequestException("Negative Content-Length: " + contentLength);
+                    }
+                    return contentLength;
+                } catch (NumberFormatException ex) {
+                    throw new MalformedRequestException("Invalid Content-Length value: " + value, ex);
+                }
+            }
+        }
+        return 0;
+    }
+
+    private static byte[] readBody(InputStream inputStream, int contentLength) throws IOException {
+        if (contentLength == 0) {
+            return new byte[0];
+        }
+
+        byte[] body = new byte[contentLength];
+        int offset = 0;
+
+        while (offset < contentLength) {
+            int bytesRead = inputStream.read(body, offset, contentLength - offset);
+            if (bytesRead == -1) {
+                throw new MalformedRequestException(
+                        "Unexpected end of stream while reading body. Expected "
+                                + contentLength
+                                + " bytes, read "
+                                + offset
+                                + " bytes."
+                );
+            }
+            offset += bytesRead;
+        }
+
+        return body;
+    }
+
+    private static final class HeaderSizeTracker {
+        private final int maxBytes;
+        private int bytesRead;
+
+        private HeaderSizeTracker(int maxBytes) {
+            this.maxBytes = maxBytes;
+        }
+
+        private void increment() throws IOException {
+            bytesRead += 1;
+            if (bytesRead > maxBytes) {
+                throw new HeaderTooLargeException(
+                        "Header section exceeds max size of " + maxBytes + " bytes"
+                );
+            }
+        }
+    }
+
+    public static class MalformedRequestException extends IOException {
+        public MalformedRequestException(String message) {
+            super(message);
+        }
+
+        public MalformedRequestException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
+    public static final class HeaderTooLargeException extends IOException {
+        public HeaderTooLargeException(String message) {
+            super(message);
+        }
+    }
+}
+```
+
+
+File 4: HttpRequest.java
+------------------------
+Job:
+- Data model that carries parsed HTTP request values across the system.
+
+Key responsibilities:
+- Store method, path, version, headers, and body.
+- Keep data immutable by copying map and body.
+- Provide readable `toString()` for logs.
+
+Full source code:
+
+```java
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+/**
+ * Immutable model for a parsed HTTP request.
+ */
+public final class HttpRequest {
+    private final String method;
+    private final String path;
+    private final String httpVersion;
+    private final Map<String, String> headers;
+    private final byte[] body;
+
+    public HttpRequest(
+            String method,
+            String path,
+            String httpVersion,
+            Map<String, String> headers,
+            byte[] body
+    ) {
+        this.method = method;
+        this.path = path;
+        this.httpVersion = httpVersion;
+        this.headers = Collections.unmodifiableMap(new LinkedHashMap<>(headers));
+        this.body = body.clone();
+    }
+
+    public String getMethod() {
+        return method;
+    }
+
+    public String getPath() {
+        return path;
+    }
+
+    public String getHttpVersion() {
+        return httpVersion;
+    }
+
+    public Map<String, String> getHeaders() {
+        return headers;
+    }
+
+    public byte[] getBody() {
+        return body.clone();
+    }
+
+    @Override
+    public String toString() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("Method: ").append(method).append('\n');
+        sb.append("Path: ").append(path).append('\n');
+        sb.append("HTTP Version: ").append(httpVersion).append('\n');
+        sb.append("Headers:").append('\n');
+
+        for (Map.Entry<String, String> header : headers.entrySet()) {
+            sb.append("  ")
+                    .append(header.getKey())
+                    .append(": ")
+                    .append(header.getValue())
+                    .append('\n');
+        }
+
+        sb.append("Body Length: ").append(body.length).append(" bytes");
+        return sb.toString();
+    }
+}
+```
+
+
+File 5: test_proxy.sh
+---------------------
+Job:
+- CLI test runner that lets you select tests and see each test output.
+
+Key responsibilities:
+- Compile Java sources.
+- Start proxy on a test port.
+- Run selected test(s): `basic_get`, `post_body`, `keep_alive`, `timeout`, `header_limit`, `malformed`.
+- Print raw request/response behavior and pass/fail summary.
+
+Full source code:
+
+```bash
+#!/usr/bin/env bash
+
+set -u -o pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PORT="18080"
+SERVER_LOG="/tmp/reverse_proxy_server.log"
+SERVER_PID=""
+
+PASS_COUNT=0
+FAIL_COUNT=0
+
+ALL_TESTS=(
+  basic_get
+  post_body
+  keep_alive
+  timeout
+  header_limit
+  malformed
+)
+
+REQUESTED_TESTS=()
+
+usage() {
+  printf 'Usage:\n'
+  printf '  %s [--port <port>] [--log <path>] <test-name> [test-name ...]\n' "$0"
+  printf '  %s [--port <port>] [--log <path>] --all\n' "$0"
+  printf '  %s --list\n\n' "$0"
+  printf 'Examples:\n'
+  printf '  %s basic_get\n' "$0"
+  printf '  %s keep_alive header_limit\n' "$0"
+  printf '  %s --all\n\n' "$0"
+  printf 'Available tests:\n'
+  list_tests
+}
+
+list_tests() {
+  printf '  basic_get    - GET /hello returns 200 + expected body\n'
+  printf '  post_body    - POST /users body is parsed (Content-Length)\n'
+  printf '  keep_alive   - Two requests on same socket (keep-alive then close)\n'
+  printf '  timeout      - Slow client is closed by read timeout\n'
+  printf '  header_limit - Oversized headers return 431\n'
+  printf '  malformed    - Malformed request line returns 400\n'
+}
+
+pass() {
+  PASS_COUNT=$((PASS_COUNT + 1))
+  printf '[PASS] %s\n' "$1"
+}
+
+fail() {
+  FAIL_COUNT=$((FAIL_COUNT + 1))
+  printf '[FAIL] %s\n' "$1"
+}
+
+require_tool() {
+  local tool_name="$1"
+  if ! command -v "$tool_name" >/dev/null 2>&1; then
+    printf 'Missing required tool: %s\n' "$tool_name"
+    exit 1
+  fi
+}
+
+cleanup() {
+  if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" >/dev/null 2>&1; then
+    kill "$SERVER_PID" >/dev/null 2>&1 || true
+    wait "$SERVER_PID" >/dev/null 2>&1 || true
+  fi
+}
+
+wait_for_server() {
+  local max_attempts=50
+  local attempt=1
+
+  while (( attempt <= max_attempts )); do
+    if curl -s --max-time 1 -o /dev/null "http://127.0.0.1:${PORT}/__health" >/dev/null 2>&1; then
+      return 0
+    fi
+
+    if ! kill -0 "$SERVER_PID" >/dev/null 2>&1; then
+      return 1
+    fi
+
+    sleep 0.2
+    attempt=$((attempt + 1))
+  done
+
+  return 1
+}
+
+assert_contains() {
+  local haystack="$1"
+  local needle="$2"
+  local message="$3"
+
+  if [[ "$haystack" == *"$needle"* ]]; then
+    pass "$message"
+  else
+    fail "$message (missing: $needle)"
+  fi
+}
+
+is_valid_test() {
+  local candidate="$1"
+  local test_name
+  for test_name in "${ALL_TESTS[@]}"; do
+    if [[ "$candidate" == "$test_name" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port)
+        if [[ $# -lt 2 ]]; then
+          printf 'Missing value for --port\n'
+          exit 1
+        fi
+        PORT="$2"
+        shift 2
+        ;;
+      --log)
+        if [[ $# -lt 2 ]]; then
+          printf 'Missing value for --log\n'
+          exit 1
+        fi
+        SERVER_LOG="$2"
+        shift 2
+        ;;
+      --all)
+        REQUESTED_TESTS=("${ALL_TESTS[@]}")
+        shift
+        ;;
+      --list)
+        list_tests
+        exit 0
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        REQUESTED_TESTS+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  if [[ "${#REQUESTED_TESTS[@]}" -eq 0 ]]; then
+    printf 'No tests selected.\n\n'
+    usage
+    exit 1
+  fi
+
+  local test_name
+  for test_name in "${REQUESTED_TESTS[@]}"; do
+    if ! is_valid_test "$test_name"; then
+      printf 'Unknown test: %s\n\n' "$test_name"
+      usage
+      exit 1
+    fi
+  done
+}
+
+run_basic_get_test() {
+  local response
+
+  printf '\n=== basic_get ===\n'
+  printf 'Request: curl -i --http1.1 http://127.0.0.1:%s/hello\n\n' "$PORT"
+
+  if ! response=$(curl -sS -i --http1.1 "http://127.0.0.1:${PORT}/hello"); then
+    fail 'basic_get request failed to execute'
+    return
+  fi
+
+  printf '%s\n' "$response"
+  assert_contains "$response" 'HTTP/1.1 200 OK' 'basic_get returns 200'
+  assert_contains "$response" 'Hello from Proxy Core' 'basic_get returns expected body'
+}
+
+run_post_body_test() {
+  local response
+
+  printf '\n=== post_body ===\n'
+  printf 'Request: curl -i --http1.1 -X POST http://127.0.0.1:%s/users -d "name=zeyad"\n\n' "$PORT"
+
+  if ! response=$(curl -sS -i --http1.1 -X POST "http://127.0.0.1:${PORT}/users" -d 'name=zeyad'); then
+    fail 'post_body request failed to execute'
+    return
+  fi
+
+  printf '%s\n' "$response"
+  assert_contains "$response" 'HTTP/1.1 200 OK' 'post_body returns 200'
+
+  sleep 0.3
+  printf '\nServer log excerpt for /users:\n'
+
+  if python3 - "$SERVER_LOG" <<'PY'
+import sys
+
+log_path = sys.argv[1]
+
+with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+    text = f.read()
+
+parts = text.split("-----------------------------------------------")
+matches = [p for p in parts if "Path: /users" in p]
+
+if not matches:
+    print("(No /users request block found)")
+    sys.exit(1)
+
+block = matches[-1].strip()
+print(block)
+
+if "Body Length: 10 bytes" not in block:
+    sys.exit(2)
+PY
+  then
+    pass 'post_body parsed Content-Length/body correctly'
+  else
+    rc=$?
+    if [[ "$rc" -eq 1 ]]; then
+      fail 'post_body /users block not found in server log'
+    else
+      fail 'post_body /users block found, but expected body length 10 bytes'
+    fi
+  fi
+}
+
+run_keep_alive_test() {
+  local output
+
+  printf '\n=== keep_alive ===\n'
+  printf 'Request: two HTTP/1.1 requests on the same socket\n\n'
+
+  if output=$(python3 - "$PORT" <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+
+def read_response(sock):
+    raw = b""
+    while b"\r\n\r\n" not in raw:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise RuntimeError("socket closed before headers")
+        raw += chunk
+
+    header_bytes, body = raw.split(b"\r\n\r\n", 1)
+    header_text = header_bytes.decode("iso-8859-1")
+    lines = header_text.split("\r\n")
+    status_line = lines[0]
+    headers = {}
+
+    for line in lines[1:]:
+        if ":" in line:
+            key, value = line.split(":", 1)
+            headers[key.strip().lower()] = value.strip()
+
+    content_length = int(headers.get("content-length", "0"))
+    while len(body) < content_length:
+        chunk = sock.recv(content_length - len(body))
+        if not chunk:
+            raise RuntimeError("socket closed before full body")
+        body += chunk
+
+    full = header_text + "\r\n\r\n" + body.decode("utf-8", errors="replace")
+    return status_line, headers, body, full
+
+s = socket.create_connection(("127.0.0.1", port), timeout=3)
+s.settimeout(3)
+
+req1 = (
+    "GET /first HTTP/1.1\r\n"
+    "Host: localhost\r\n"
+    "Connection: keep-alive\r\n"
+    "\r\n"
+)
+req2 = (
+    "GET /second HTTP/1.1\r\n"
+    "Host: localhost\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+)
+
+s.sendall(req1.encode("ascii"))
+status1, headers1, body1, full1 = read_response(s)
+
+s.sendall(req2.encode("ascii"))
+status2, headers2, body2, full2 = read_response(s)
+
+s.close()
+
+print("--- Response 1 ---")
+print(full1)
+print("--- Response 2 ---")
+print(full2)
+
+ok = (
+    status1 == "HTTP/1.1 200 OK"
+    and status2 == "HTTP/1.1 200 OK"
+    and headers1.get("connection", "").lower() == "keep-alive"
+    and headers2.get("connection", "").lower() == "close"
+    and body1 == b"Hello from Proxy Core"
+    and body2 == b"Hello from Proxy Core"
+)
+
+sys.exit(0 if ok else 1)
+PY
+  ); then
+    printf '%s\n' "$output"
+    pass 'keep_alive works across two requests on one connection'
+  else
+    printf '%s\n' "$output"
+    fail 'keep_alive behavior mismatch'
+  fi
+}
+
+run_timeout_test() {
+  local output
+
+  printf '\n=== timeout ===\n'
+  printf 'Request: send partial request, wait > 10s, then continue\n\n'
+
+  if output=$(python3 - "$PORT" <<'PY'
+import socket
+import sys
+import time
+
+port = int(sys.argv[1])
+s = socket.create_connection(("127.0.0.1", port), timeout=3)
+s.settimeout(3)
+
+s.sendall(b"GET /slow HTTP/1.1\r\n")
+print("Sent partial request line. Sleeping 11s...")
+time.sleep(11.0)
+
+closed = False
+result = ""
+
+try:
+    s.sendall(b"Host: localhost\r\n\r\n")
+    data = s.recv(1024)
+    if data == b"":
+        closed = True
+        result = "Socket closed (EOF)"
+    else:
+        result = "Received data: " + data.decode("utf-8", errors="replace")
+except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError) as ex:
+    closed = True
+    result = "Connection closed with exception: " + type(ex).__name__
+
+s.close()
+print(result)
+sys.exit(0 if closed else 1)
+PY
+  ); then
+    printf '%s\n' "$output"
+    pass 'timeout closes slow connection'
+  else
+    printf '%s\n' "$output"
+    fail 'timeout test failed (connection stayed open)'
+  fi
+}
+
+run_header_limit_test() {
+  local output
+
+  printf '\n=== header_limit ===\n'
+  printf 'Request: send >16KB header and inspect response\n\n'
+
+  if ! output=$(python3 - "$PORT" <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+huge_header = "a" * (17 * 1024)
+request = (
+    "GET /big HTTP/1.1\r\n"
+    "Host: localhost\r\n"
+    f"X-Huge: {huge_header}\r\n"
+    "\r\n"
+)
+
+s = socket.create_connection(("127.0.0.1", port), timeout=3)
+s.settimeout(3)
+s.sendall(request.encode("ascii"))
+
+data = b""
+try:
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+except ConnectionResetError:
+    pass
+
+s.close()
+print(data.decode("utf-8", errors="replace"))
+PY
+  ); then
+    fail 'header_limit test failed to execute'
+    return
+  fi
+
+  printf '%s\n' "$output"
+  assert_contains "$output" '431 Request Header Fields Too Large' 'header_limit returns 431'
+}
+
+run_malformed_request_test() {
+  local output
+
+  printf '\n=== malformed ===\n'
+  printf 'Request: malformed request line (missing HTTP version)\n\n'
+
+  if ! output=$(python3 - "$PORT" <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+request = b"GET /broken\r\nHost: localhost\r\n\r\n"
+
+s = socket.create_connection(("127.0.0.1", port), timeout=3)
+s.settimeout(3)
+s.sendall(request)
+
+data = b""
+try:
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+except ConnectionResetError:
+    pass
+
+s.close()
+print(data.decode("utf-8", errors="replace"))
+PY
+  ); then
+    fail 'malformed test failed to execute'
+    return
+  fi
+
+  printf '%s\n' "$output"
+  assert_contains "$output" '400 Bad Request' 'malformed request returns 400'
+}
+
+run_single_test() {
+  local test_name="$1"
+  case "$test_name" in
+    basic_get)
+      run_basic_get_test
+      ;;
+    post_body)
+      run_post_body_test
+      ;;
+    keep_alive)
+      run_keep_alive_test
+      ;;
+    timeout)
+      run_timeout_test
+      ;;
+    header_limit)
+      run_header_limit_test
+      ;;
+    malformed)
+      run_malformed_request_test
+      ;;
+  esac
+}
+
+main() {
+  trap cleanup EXIT
+
+  parse_args "$@"
+
+  require_tool javac
+  require_tool java
+  require_tool curl
+  require_tool python3
+
+  cd "$SCRIPT_DIR"
+
+  printf 'Compiling Java sources...\n'
+  if ! javac *.java; then
+    printf 'Compilation failed.\n'
+    exit 1
+  fi
+
+  : > "$SERVER_LOG"
+
+  printf 'Starting ProxyServer on port %s...\n' "$PORT"
+  java ProxyServer "$PORT" > "$SERVER_LOG" 2>&1 &
+  SERVER_PID=$!
+
+  if ! wait_for_server; then
+    printf 'Server failed to start. See log: %s\n' "$SERVER_LOG"
+    exit 1
+  fi
+
+  printf 'Running selected tests: %s\n' "${REQUESTED_TESTS[*]}"
+
+  local test_name
+  for test_name in "${REQUESTED_TESTS[@]}"; do
+    run_single_test "$test_name"
+  done
+
+  printf '\nTest summary: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
+  printf 'Server log: %s\n' "$SERVER_LOG"
+
+  if (( FAIL_COUNT > 0 )); then
+    exit 1
+  fi
+}
+
+main "$@"
+```
+
+
+How to Run
+----------
+Compile and run server:
+
+```bash
+javac *.java
+java ProxyServer 8080
+```
+
+Run selected tests:
+
+```bash
+./test_proxy.sh --list
+./test_proxy.sh basic_get keep_alive
+./test_proxy.sh --all
+```
+
+
+Current Phase Status
+--------------------
+Completed in this phase:
+- Core TCP accept loop and worker model
+- Manual HTTP parser
+- Content-Length based body reading
+- Socket read timeout protection
+- Header-size limit protection
+- Keep-alive behavior
+- Dummy response path for end-to-end checks
+- Test automation script with selectable tests

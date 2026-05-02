@@ -1,0 +1,31 @@
+{
+  "server": {
+    "port": 8443,
+    "workerPoolSize": 200,
+    "socketTimeoutMs": 10000,
+    "maxHeaderBytes": 16384,
+    "maxKeepAliveRequests": 100
+  },
+  "keystore": {
+    "path": "certs/server.p12",
+    "password": "password"
+  },
+  "logging": {
+    "accessLogPath": "logs/access.log",
+    "errorLogPath": "logs/error.log",
+    "systemLogPath": "logs/system.log"
+  },
+  "rateLimiter": {
+    "maxTokens": 10,
+    "refillRateMs": 500
+  },
+  "circuitBreaker": {
+    "failureThreshold": 5,
+    "resetTimeoutMs": 30000
+  },
+  "backends": [
+    {"host": "127.0.0.1", "port": 8081},
+    {"host": "127.0.0.1", "port": 8082},
+    {"host": "127.0.0.1", "port": 8083}
+  ]
+}
